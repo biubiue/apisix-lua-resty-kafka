@@ -4,18 +4,14 @@
 local broker = require "resty.kafka.broker"
 local request = require "resty.kafka.request"
 
+local errors = require "resty.kafka.errors"
+
 
 local setmetatable = setmetatable
 local timer_at = ngx.timer.at
 local ngx_log = ngx.log
 local ERR = ngx.ERR
-local INFO = ngx.INFO
-local DEBUG = ngx.DEBUG
-local debug = ngx.config.debug
 local pid = ngx.worker.pid
-local time = ngx.time
-local sleep = ngx.sleep
-local ceil = math.ceil
 local pairs = pairs
 
 
@@ -25,7 +21,7 @@ if not ok then
 end
 
 
-local _M = { _VERSION = "0.10" }
+local _M = { _VERSION = "0.12" }
 local mt = { __index = _M }
 
 
@@ -42,10 +38,9 @@ local function _metadata_cache(self, topic)
     return nil, "not found topic"
 end
 
-
-local function metadata_encode(client_id, topics, num)
+local function metadata_encode(client_id, topics, num, api_version)
     local id = 0    -- hard code correlation_id
-    local req = request:new(request.MetadataRequest, id, client_id, request.API_VERSION_V1)
+    local req = request:new(request.MetadataRequest, id, client_id, api_version)
 
     req:int32(num)
 
@@ -66,16 +61,16 @@ local function metadata_decode(resp)
         brokers[nodeid] = {
             host = resp:string(),
             port = resp:int32(),
-            rack = resp:string(),
         }
     end
-    local conrtrol_id = resp:int32()
+
     local topic_num = resp:int32()
     local topics = new_tab(0, topic_num)
+
     for i = 1, topic_num do
         local tp_errcode = resp:int16()
         local topic = resp:string()
-        local is_internal  = resp:int8()
+
         local partition_num = resp:int32()
         local topic_info = new_tab(partition_num - 1, 3)
 
@@ -133,22 +128,15 @@ local function _fetch_metadata(self, new_topic)
     local req = metadata_encode(self.client_id, topics, num)
 
     for i = 1, #broker_list do
-        local host, port, sasl_config = broker_list[i].host,
-                                        broker_list[i].port,
-                                        broker_list[i].sasl_config
+        local host, port = broker_list[i].host, broker_list[i].port
+        local bk = broker:new(host, port, sc, self.auth_config)
 
-        local bk = broker:new(host, port, sc, sasl_config)
         local resp, err = bk:send_receive(req)
         if not resp then
-            ngx_log(INFO, "broker fetch metadata failed, err:", err,
+            ngx_log(ERR, "broker fetch metadata failed, err:", err,
                           ", host: ", host, ", port: ", port)
         else
             local brokers, topic_partitions = metadata_decode(resp)
-            -- Confluent Cloud need the SASL auth on all requests, including to brokers
-            -- we have been referred to. This injects the SASL auth in.
-            for j = 1, #brokers do
-                brokers[j].sasl_config = sasl_config
-            end
             self.brokers, self.topic_partitions = brokers, topic_partitions
 
             return brokers, topic_partitions
@@ -158,9 +146,60 @@ local function _fetch_metadata(self, new_topic)
     ngx_log(ERR, "all brokers failed in fetch topic metadata")
     return nil, "all brokers failed in fetch topic metadata"
 end
-
-
 _M.refresh = _fetch_metadata
+
+
+local function _fetch_apiversions(self)
+    local correlation_id = 0
+    local client_id = self.client_id
+    -- deliberately set ApiVersion to 0 to get corresponding response
+    local api_version = 0
+    local req = request:new(request.ApiVersions, correlation_id, client_id, api_version)
+    -- why is this necessary in metadata_encode? Not sure what the purpose is
+    -- local num = 0
+    -- req:int32(num)
+    local broker_list = self.broker_list
+    local sc = self.socket_config
+    for i = 1, #broker_list do
+        local host, port = broker_list[i].host, broker_list[i].port
+        -- apiversions do not need authentication
+        local bk = broker:new(host, port, sc)
+
+        local resp, err = bk:send_receive(req)
+        if not resp then
+            ngx_log(ERR, "broker fetch apiversions failed, err:", err,
+                        ", host: ", host, ", port: ", port)
+        else
+            --[[
+            ApiVersions Response (Version: 0) => error_code [api_keys] 
+            error_code => INT16
+            api_keys => api_key min_version max_version 
+                api_key => INT16
+                min_version => INT16
+                max_version => INT16
+            ]]
+            -- error code first 16 bits
+            local error_code = resp:int16()
+            if error_code ~= 0 then
+                return {}, errors[error_code]
+            end
+            -- number of api_keys in reponse
+            local api_keys_num = resp:int32()
+            local api_keys = new_tab(0, api_keys_num)
+
+            for j = 1, api_keys_num do
+                local api_key = resp:int16()
+                api_keys[api_key] = {
+                    min_version = resp:int16(),
+                    max_version = resp:int16()
+                }
+            end
+            self.supported_api_versions = api_keys
+            return api_keys, nil
+        end
+    end
+
+end
 
 
 local function meta_refresh(premature, self, interval)
@@ -169,6 +208,7 @@ local function meta_refresh(premature, self, interval)
     end
 
     _fetch_metadata(self)
+    _fetch_apiversions(self)
 
     local ok, err = timer_at(interval, meta_refresh, self, interval)
     if not ok then
@@ -177,22 +217,29 @@ local function meta_refresh(premature, self, interval)
 end
 
 
+
+
 function _M.new(self, broker_list, client_config)
     local opts = client_config or {}
     local socket_config = {
         socket_timeout = opts.socket_timeout or 3000,
-        keepalive_timeout = opts.keepalive_timeout or 600 * 1000,   -- 10 min
+        keepalive_timeout = opts.keepalive_timeout or (600 * 1000),   -- 10 min
         keepalive_size = opts.keepalive_size or 2,
         ssl = opts.ssl or false,
-        ssl_verify = opts.ssl_verify or false
+        ssl_verify = opts.ssl_verify or false,
+        client_cert = opts.client_cert or nil,
+        client_priv_key = opts.client_priv_key or nil,
     }
 
+    
     local cli = setmetatable({
         broker_list = broker_list,
         topic_partitions = {},
         brokers = {},
+        supported_api_versions = {},
         client_id = "worker" .. pid(),
         socket_config = socket_config,
+        auth_config = opts.auth_config or nil
     }, mt)
 
     if opts.refresh_interval then
@@ -202,6 +249,11 @@ function _M.new(self, broker_list, client_config)
     return cli
 end
 
+-- expose fetch_apiversions to module scope
+function _M.fetch_apiversions(self)
+    return _fetch_apiversions(self)
+end
+
 
 function _M.fetch_metadata(self, topic)
     local brokers, partitions = _metadata_cache(self, topic)
@@ -209,7 +261,15 @@ function _M.fetch_metadata(self, topic)
         return brokers, partitions
     end
 
-    _fetch_metadata(self, topic)
+    -- raise if not ok and err
+    local ok_meta, err_meta = _fetch_metadata(self, topic)
+    if not ok_meta and err_meta then
+        return nil, err_meta
+    end
+    local ok_apiver, err_apiver = _fetch_apiversions(self)
+    if not ok_apiver and err_apiver then
+        return nil, err_apiver
+    end
 
     return _metadata_cache(self, topic)
 end

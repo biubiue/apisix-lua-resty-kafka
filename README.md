@@ -1,7 +1,17 @@
+Different
+=====
+Support auth, but not use ssl.
+if you want to use mTLS or SASL,see [lua-resty-kafka](https://github.com/kong/lua-resty-kafka)
+
+Why write this
+=====
+Because when use [lua-resty-kafka](https://github.com/doujiang24/lua-resty-kafka) , auth not work right, like this [issue](https://github.com/doujiang24/lua-resty-kafka/issues/118)
+
+
 Name
 =====
+lua-resty-kafka - Lua kafka client driver for the ngx_lua based on the cosocket API.
 
-lua-resty-kafka - Lua kafka client driver for the ngx_lua based on the cosocket API
 
 Table of Contents
 =================

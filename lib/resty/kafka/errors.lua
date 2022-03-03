@@ -19,6 +19,8 @@ local _M = {
     [14]    = 'OffsetsLoadInProgressCode',
     [15]    = 'ConsumerCoordinatorNotAvailableCode',
     [16]    = 'NotCoordinatorForConsumerCode',
+    [34]    = 'IllegalSaslState',
+    [63]    = 'DelegationTokenOwnerMisMatch'
 }
 
 
